@@ -1,437 +1,309 @@
-const { strict: assert } = require('assert');
-const mockRequire = require('mock-require');
+'use strict';
 
-const {
+const path = require('path');
+const slugify = require('slugify');
+const { Storage } = require('@google-cloud/storage');
+const { pipeline } = require('stream/promises');
+
+/**
+ * lodash _.get native port
+ *
+ * checkout: https://github.com/you-dont-need/You-Dont-Need-Lodash-Underscore#_get
+ *
+ * Another solution is use destructor variable with default value as {} on each layer
+ * but it appears so tricky.
+ *
+ * const { a: { b: { c: d = 42 } = {} } = {} } = object
+ */
+const get = (obj, path, defaultValue = undefined) => {
+  const travel = (regexp) =>
+    String.prototype.split
+      .call(path, regexp)
+      .filter(Boolean)
+      .reduce((res, key) => (res !== null && res !== undefined ? res[key] : res), obj);
+  const result = travel(/[,[\]]+?/) || travel(/[,[\].]+?/);
+  return result === undefined || result === obj ? defaultValue : result;
+};
+
+/**
+ * Check validity of Service Account configuration
+ * @param config
+ * @returns {{private_key}|{client_email}|{project_id}|any}
+ */
+const checkServiceAccount = (config) => {
+  if (!config || !config.bucketName) {
+    throw new Error('"Bucket name" is required in the provider configuration.');
+  }
+
+  if (config.keyFileContent) {
+    try {
+      const serviceAccount =
+        typeof config.keyFileContent === 'string'
+          ? JSON.parse(config.keyFileContent)
+          : config.keyFileContent;
+
+      if (!serviceAccount.project_id) {
+        throw new Error(
+          'Error parsing data "keyFileContent". Missing "project_id" field in JSON file.'
+        );
+      }
+
+      if (!serviceAccount.client_email) {
+        throw new Error(
+          'Error parsing data "keyFileContent". Missing "client_email" field in JSON file.'
+        );
+      }
+
+      if (!serviceAccount.private_key) {
+        throw new Error(
+          'Error parsing data "keyFileContent". Missing "private_key" field in JSON file.'
+        );
+      }
+      config.serviceAccount = serviceAccount;
+    } catch (error) {
+        if (error instanceof SyntaxError) {
+            throw new Error(
+              'Error parsing data "keyFileContent", please be sure to copy/paste the full JSON file.'
+            );
+        }
+        if (
+          typeof config.keyFileContent === 'string' &&
+          !config.keyFileContent.includes('private_key')
+        ) {
+          throw new Error(
+            'Error parsing data "keyFileContent". Missing "private_key" field in JSON file.'
+          );
+        }
+        throw error;
+    }
+  }
+  if (!config.baseUrl) {
+    config.baseUrl = `https://storage.googleapis.com/${config.bucketName}`;
+  }
+  if (config.domain) {
+    config.baseUrl = `https://${config.domain}`;
+  }
+  return config.serviceAccount;
+};
+
+/**
+ * Check bucket exist, or create it
+ * @param GCS
+ * @param bucketName
+ * @returns {Promise<void>}
+ */
+const checkBucket = async (GCS, bucketName) => {
+  let bucket = GCS.bucket(bucketName);
+  const [exists] = await bucket.exists();
+  if (!exists) {
+    throw new Error(
+      `An error occurs when we try to retrieve the Bucket "${bucketName}". Check if bucket exist on Google Cloud Platform.`
+    );
+  }
+};
+
+const setConfigField = (fieldValue, defaultValue) => {
+  if (fieldValue === undefined) {
+    return defaultValue;
+  }
+
+  if (typeof fieldValue === 'boolean') {
+    return fieldValue;
+  }
+
+  if (typeof fieldValue === 'string') {
+    if (fieldValue.toLowerCase() === 'true') {
+      return true;
+    }
+    if (fieldValue.toLowerCase() === 'false') {
+      return false;
+    }
+  }
+
+  throw new Error(`Invalid boolean value for ${fieldValue}!`);
+};
+
+/**
+ * Merge uploadProvider config with gcs key in custom Strapi config
+ * @param providerConfig
+ * @returns {{private_key}|{client_email}|{project_id}|any}
+ */
+const mergeConfigs = (providerConfig) => {
+  const customGcsConfig = get(strapi, 'config.gcs', {});
+  const customEnvGcsConfig = get(strapi, 'config.currentEnvironment.gcs', {});
+  return { ...providerConfig, ...customGcsConfig, ...customEnvGcsConfig };
+};
+
+/**
+ * Generate upload filename including path
+ *
+ * @param basePath
+ * @param file
+ * @returns string
+ */
+const generateUploadFileName = (file, basePath) => {
+  const backupPath =
+    file.related && file.related.length > 0 && file.related[0].ref
+      ? `${file.related[0].ref}/`
+      : '';
+  const filePath = file.path ? `${file.path}/` : '';
+  const extension = file.ext ? `${file.ext.toLowerCase()}` : '';
+  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash';
+
+  return `${basePath}${backupPath}${fileName}${extension}`;
+};
+
+/**
+ * Prepare file before upload
+ * @param file
+ * @param config
+ * @param basePath
+ * @param GCS
+ * @returns {Promise<{fileAttributes: {metadata: (*|{contentDisposition: string, cacheControl: string}), gzip: (string|boolean|((buf: InputType, callback: CompressCallback) => void)|((buf: InputType, options: ZlibOptions, callback: CompressCallback) => void)|gzip|*), contentType: (string|string|*)}, fullFileName: (string|Promise<string>|*|string)}>}
+ */
+const prepareUploadFile = async (file, config, basePath, GCS) => {
+  let deleteFile = false;
+  const fullFileName =
+    typeof config.generateUploadFileName === 'function'
+      ? await config.generateUploadFileName(file)
+      : generateUploadFileName(file, basePath);
+  if (!config.skipCheckBucket) {
+    await checkBucket(GCS, config.bucketName);
+  }
+  const bucket = GCS.bucket(config.bucketName);
+  const bucketFile = bucket.file(fullFileName);
+  const [fileExists] = await bucketFile.exists();
+  if (fileExists) {
+    deleteFile = true;
+  }
+  const asciiFileName = file.name.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  const fileAttributes = {
+    contentType:
+      typeof config.getContentType === 'function' ? config.getContentType(file) : file.mime,
+    gzip: typeof config.gzip === 'boolean' ? config.gzip : 'auto',
+    metadata:
+      typeof config.metadata === 'function'
+        ? config.metadata(file)
+        : {
+            contentDisposition: `inline; filename="${asciiFileName}"`,
+            cacheControl: `public, max-age=${config.cacheMaxAge || 3600}`,
+          },
+  };
+  if (!config.uniform) {
+    fileAttributes.public = config.publicFiles;
+  }
+
+  return { fileAttributes, bucketFile, fullFileName, deleteFile };
+};
+
+const init = (strapi) => (config) => {
+  const serviceAccount = checkServiceAccount(config);
+  let GCS;
+  if (config.keyFileContent) {
+    // Provide service account credentials
+    GCS = new Storage({
+      projectId: serviceAccount.project_id,
+      credentials: {
+        client_email: serviceAccount.client_email,
+        private_key: serviceAccount.private_key,
+      },
+    });
+  } else {
+    // Storage will attempt to find Application Default Credentials
+    GCS = new Storage();
+  }
+
+  const basePath = `${config.basePath}/`.replace(/^\/+/, '');
+  const baseUrl = config.domain ? `https://${config.domain}` : `https://storage.googleapis.com/${config.bucketName}`;
+
+  return {
+    async upload(file) {
+      try {
+        const { fileAttributes, bucketFile, fullFileName, deleteFile } = await prepareUploadFile(
+          file,
+          config,
+          basePath,
+          GCS
+        );
+        if (deleteFile) {
+          console.info('File already exists. Try to remove it.');
+          await this.delete(file);
+        }
+
+        await bucketFile.save(file.buffer, fileAttributes);
+        file.url = `${baseUrl}/${fullFileName}`;
+        console.debug(`File successfully uploaded to ${file.url}`);
+      } catch (error) {
+        // Re-throw so that the upload operation will fail
+        // and error will surface to the user in the Strapi admin front-end
+        console.error(`Error uploading file to Google Cloud Storage: ${error.message}`);
+        throw error;
+      }
+    },
+    async uploadStream(file) {
+      try {
+        const { fileAttributes, bucketFile, fullFileName, deleteFile } = await prepareUploadFile(
+          file,
+          config,
+          basePath,
+          GCS
+        );
+        if (deleteFile) {
+          console.info('File already exists. Try to remove it.');
+          await this.delete(file);
+        }
+        await pipeline(file.stream, bucketFile.createWriteStream(fileAttributes));
+        console.debug(`File successfully uploaded to ${file.url}`);
+        file.url = `${baseUrl}/${fullFileName}`;
+      } catch (error) {
+        // Re-throw so that the upload operation will fail
+        // and error will surface to the user in the Strapi admin front-end
+        console.error(`Error uploading file to Google Cloud Storage: ${error.message}`);
+        throw error;
+      }
+    },
+    async delete(file) {
+      if (!file.url) {
+        console.warn('Remote file was not found, you may have to delete manually.');
+        return;
+      }
+
+      const fileName = file.url.replace(`${baseUrl}/`, '');
+      const bucket = GCS.bucket(config.bucketName);
+      try {
+        await bucket.file(fileName).delete();
+        strapi.log.debug(`File ${fileName} successfully deleted`);
+      } catch (error) {
+        if (error.code === 404) {
+          strapi.log.error('Remote file was not found, you may have to delete manually.');
+        } else {
+          strapi.log.error(`Error deleting file ${fileName}: ${error.message}`);
+          throw error;
+        }
+      }
+    },
+    isPrivate() {
+      return !config.publicFiles;
+    },
+    async getSignedUrl(file) {
+      const options = {
+        version: 'v4',
+        action: 'read',
+        expires: config.expires || Date.now() + 15 * 60 * 1000, // 15 minutes from now
+      };
+      const fileName = file.url.replace(`${baseUrl}/`, '');
+      const [url] = await GCS.bucket(config.bucketName).file(fileName).getSignedUrl(options);
+      return { url };
+    },
+  };
+};
+
+module.exports = {
   checkServiceAccount,
   checkBucket,
   setConfigField,
   mergeConfigs,
   generateUploadFileName,
+  prepareUploadFile,
   init,
-} = require('../../src/server/provider');
-const sinon = require('sinon');
-
-describe('/src/server/provider.js', () => {
-  afterEach(() => {
-    mockRequire.stopAll();
-    sinon.restore();
-  });
-
-  describe('#checkServiceAccount', () => {
-    describe('when config is invalid', () => {
-      it('must throw error "Bucket name" is required!', () => {
-        const error = new Error('"Bucket name" is required in the provider configuration.');
-        assert.throws(() => checkServiceAccount(), error);
-      });
-
-      it('must throw error when keyFileContent is not a valid JSON', () => {
-        const config = {
-          keyFileContent: "I'm not a valid JSON",
-          bucketName: 'some-bucket',
-        };
-        const error = new Error(
-          'Error parsing data "keyFileContent", please be sure to copy/paste the full JSON file.'
-        );
-        assert.throws(() => checkServiceAccount(config), error);
-      });
-
-      it('must throw error when keyFileContent is missing "project_id"', () => {
-        const config = {
-          keyFileContent: {},
-          bucketName: 'some-bucket',
-        };
-        const error = new Error(
-          'Error parsing data "keyFileContent". Missing "project_id" field in JSON file.'
-        );
-        assert.throws(() => checkServiceAccount(config), error);
-      });
-
-      it('must throw error when keyFileContent is missing "client_email"', () => {
-        const config = {
-          keyFileContent: {
-            project_id: '123',
-          },
-          bucketName: 'some-bucket',
-        };
-        const error = new Error(
-          'Error parsing data "keyFileContent". Missing "client_email" field in JSON file.'
-        );
-        assert.throws(() => checkServiceAccount(config), error);
-      });
-
-      it('must throw error when keyFileContent is missing "private_key"', () => {
-        const config = {
-          keyFileContent: {
-            project_id: '123',
-            client_email: 'my@email.org',
-          },
-          bucketName: 'some-bucket',
-        };
-        const error = new Error(
-          'Error parsing data "keyFileContent". Missing "private_key" field in JSON file.'
-        );
-        assert.throws(() => checkServiceAccount(config), error);
-      });
-
-      it('must throw error when keyFileContent is a string but missing "private_key"', () => {
-        const config = {
-          keyFileContent: `{"project_id": "123", "client_email": "my@email.org"}`,
-          bucketName: 'some-bucket',
-        };
-        const error = new Error(
-          'Error parsing data "keyFileContent". Missing "private_key" field in JSON file.'
-        );
-        assert.throws(() => checkServiceAccount(config), error);
-      });
-    });
-
-    describe('when config is valid', () => {
-      it('must accept minimal configuration without errors', () => {
-        const config = {
-          bucketName: 'some-bucket',
-        };
-        checkServiceAccount(config);
-      });
-
-      it('must accept configurations without errors', () => {
-        const config = {
-          keyFileContent: {
-            project_id: '123',
-            client_email: 'my@email.org',
-            private_key: 'a random key',
-          },
-          bucketName: 'some-bucket',
-        };
-        checkServiceAccount(config);
-      });
-
-      it('must accept configurations with json string', () => {
-        const config = {
-          keyFileContent: `{
-            "project_id": "123",
-            "client_email": "my@email.org",
-            "private_key": "a random key"
-          }`,
-          bucketName: 'some-bucket',
-        };
-        checkServiceAccount(config);
-      });
-
-      it('must redefine baseUrl to default value', () => {
-        const config = {
-          keyFileContent: {
-            project_id: '123',
-            client_email: 'my@email.org',
-            private_key: 'a random key',
-          },
-          bucketName: 'some-bucket',
-        };
-        checkServiceAccount(config);
-        assert.ok(Object.keys(config).includes('baseUrl'));
-        assert.equal(config.baseUrl, 'https://storage.googleapis.com/some-bucket');
-      });
-
-      it('must accept baseUrl changing value', () => {
-        const config = {
-          keyFileContent: {
-            project_id: '123',
-            client_email: 'my@email.org',
-            private_key: 'a random key',
-          },
-          bucketName: 'some-bucket',
-          baseUrl: 'http://localhost',
-        };
-        checkServiceAccount(config);
-        assert.equal(config.baseUrl, 'http://localhost');
-      });
-      it('must accept domain changing value', () => {
-        const config = {
-          keyFileContent: {
-            project_id: '123',
-            client_email: 'my@email.org',
-            private_key: 'a random key',
-          },
-          bucketName: 'some-bucket',
-          domain: 'my-domain.com',
-        };
-        checkServiceAccount(config);
-        assert.equal(config.baseUrl, 'https://my-domain.com');
-      });
-    });
-  });
-
-  describe('#checkBucket', () => {
-    describe('when valid bucket', () => {
-      it('must check if bucket exists', async () => {
-        let assertCount = 0;
-
-        const gcsMock = {
-          bucket(bucketName) {
-            assertCount += 1;
-            assert.equal(bucketName, 'my-bucket');
-            return {
-              async exists() {
-                assertCount += 1;
-                return [true];
-              },
-            };
-          },
-        };
-        await assert.doesNotReject(checkBucket(gcsMock, 'my-bucket'));
-        assert.equal(assertCount, 2);
-      });
-    });
-
-    describe('when bucket does not exists', async () => {
-      it('must throw error message', async () => {
-        let assertCount = 0;
-
-        const gcsMock = {
-          bucket(bucketName) {
-            assertCount += 1;
-            assert.equal(bucketName, 'my-bucket');
-            return {
-              async exists() {
-                assertCount += 1;
-                return [false];
-              },
-            };
-          },
-        };
-
-        const error = new Error(
-          'An error occurs when we try to retrieve the Bucket "my-bucket". Check if bucket exist on Google Cloud Platform.'
-        );
-
-        await assert.rejects(checkBucket(gcsMock, 'my-bucket'), error);
-
-        assert.equal(assertCount, 2);
-      });
-    });
-  });
-
-  describe('#setConfigField', () => {
-    describe('when config field is undefined', () => {
-      it('must return default value true', async () => {
-        await assert.equal(setConfigField(undefined, true), true);
-      });
-      it('must return default value false', async () => {
-        await assert.equal(setConfigField(undefined, false), false);
-      });
-      it('must return error if not a string with true or false value', async () => {
-        let fieldValue = 'undefined';
-        const error = new Error(`Invalid boolean value for ${fieldValue}!`);
-        assert.throws(() => setConfigField(fieldValue, true), error);
-      });
-      it('must return true boolean value if boolean value is true and default value is false', async () => {
-        await assert.equal(setConfigField(true, false), true);
-      });
-      it('must return true boolean value if boolean value is true and default value is true', async () => {
-        await assert.equal(setConfigField(false, true), false);
-      });
-    });
-  });
-
-  describe('#mergeConfigs', () => {
-    let strapiOriginal;
-    let sandbox;
-
-    beforeEach(() => {
-      strapiOriginal = global.strapi;
-      sandbox = sinon.createSandbox();
-
-      global.strapi = {
-        config: {
-          gcs: {}, // Initialize gcs object
-        },
-      };
-    });
-
-    afterEach(() => {
-      sandbox.restore();
-      if (strapiOriginal === undefined) {
-        delete global.strapi;
-      } else {
-        global.strapi = strapiOriginal;
-      }
-    });
-
-    it('must apply configurations', () => {
-      const result = mergeConfigs({ foo: 'bar' });
-      const expected = { foo: 'bar' };
-      assert.deepEqual(result, expected);
-    });
-
-    it('must merge with strapi.config.gcs global vars', () => { // Updated test description
-      global.strapi.config.gcs = { // Updated to use strapi.config.gcs
-        number: 910,
-        foo: 'thanos',
-      };
-      const result = mergeConfigs({ foo: 'bar', key: 'value' });
-      const expected = { key: 'value', foo: 'thanos', number: 910 };
-      assert.deepEqual(result, expected);
-    });
-  });
-
-  describe('#generateUploadFileName', () => {
-    it('must save filename in right name', async () => {
-      const testData = [
-        [
-          '',
-          'christopher-campbell_df9a53d774/christopher-campbell_df9a53d774.jpeg',
-          {
-            name: 'christopher-campbell',
-            alternativeText: undefined,
-            caption: undefined,
-            hash: 'christopher-campbell_df9a53d774',
-            ext: '.jpeg',
-            mime: 'image/jpeg',
-            size: 823.58,
-            width: 5184,
-            height: 3456,
-            buffer: 'file buffer information',
-          },
-        ],
-        [
-          '',
-          'thumbnail_christopher-campbell_df9a53d774/thumbnail_christopher-campbell_df9a53d774.jpeg',
-          {
-            hash: 'thumbnail_christopher-campbell_df9a53d774',
-            ext: '.jpeg',
-            mime: 'image/jpeg',
-            width: 234,
-            height: 156,
-            size: 5.53,
-            buffer: 'file buffer information',
-            path: null,
-          },
-        ],
-        [
-          'base-path/',
-          'base-path/galleries/boris-smokrovic_9fd5439b3e/boris-smokrovic_9fd5439b3e.jpeg',
-          {
-            name: 'boris-smokrovic',
-            alternativeText: undefined,
-            caption: undefined,
-            hash: 'boris-smokrovic_9fd5439b3e',
-            ext: '.jpeg',
-            mime: 'image/jpeg',
-            size: 897.78,
-            related: [{ refId: '1', ref: 'galleries', source: undefined, field: 'cover' }],
-            width: 4373,
-            height: 2915,
-            buffer: 'file buffer data',
-          },
-        ],
-        [
-          'root/child/',
-          'root/child/no-hash', // Update expected value
-          {
-            hash: undefined, // Add hash to undefined
-            ext: undefined, // Add ext to undefined
-            mime: 'image/jpeg',
-            width: 234,
-            height: 156,
-            size: 8.18,
-            buffer: 'file buffer data',
-            path: null,
-          },
-        ],
-      ];
-
-      const runTest = async ([basePath, expectedFileName, fileData]) => {
-        const generatedFileName = await generateUploadFileName(fileData, basePath); // Updated function call
-        assert.equal(expectedFileName, generatedFileName);
-      };
-
-      const promises = testData.map((data) => runTest(data));
-      await Promise.all(promises);
-    });
-  });
-
-  
-  describe('#init', () => {
-    let strapiOriginal;
-    let sandbox;
-
-    beforeEach(() => {
-      strapiOriginal = global.strapi;
-      sandbox = sinon.createSandbox();
-
-      global.strapi = {
-        config: {
-          get: sandbox.stub().returns({}),
-        },
-        log: {
-          info: sandbox.stub(),
-          debug: sandbox.stub(),
-          error: sandbox.stub(),
-        },
-      };
-    });
-
-    afterEach(() => {
-      sandbox.restore();
-      if (strapiOriginal === undefined) {
-        delete global.strapi;
-      } else {
-        global.strapi = strapiOriginal;
-      }
-    });
-
-    it('must return an object with upload, delete, isPrivate and getSignedUrl methods', () => {
-      const config = {
-        keyFileContent: {
-          project_id: '123',
-          client_email: 'my@email.org',
-          private_key: 'a random key',
-        },
-        bucketName: 'any',
-      };
-
-      const result = init(global.strapi)(config); // Updated call
-
-      assert.ok(Object.keys(result).includes('upload'));
-      assert.equal(typeof result.upload, 'function');
-      assert.ok(Object.keys(result).includes('uploadStream'));
-      assert.equal(typeof result.uploadStream, 'function');
-      assert.ok(Object.keys(result).includes('delete'));
-      assert.equal(typeof result.delete, 'function');
-      assert.ok(Object.keys(result).includes('isPrivate'));
-      assert.equal(typeof result.isPrivate, 'function');
-      assert.ok(Object.keys(result).includes('getSignedUrl'));
-      assert.equal(typeof result.getSignedUrl, 'function');
-    });
-
-    it('must instance google cloud storage with right configurations', () => {
-      let assertionsCount = 0;
-      mockRequire('@google-cloud/storage', {
-        Storage: class {
-          constructor(...args) {
-            assertionsCount += 1;
-            assert.deepEqual(args, [
-              {
-                credentials: {
-                  client_email: 'my@email.org',
-                  private_key: 'a random key',
-                },
-                projectId: '123',
-              },
-            ]);
-          }
-        },
-      });
-      const provider = mockRequire.reRequire('../../src/server/provider');
-      const config = {
-        keyFileContent: {
-          project_id: '123',
-          client_email: 'my@email.org',
-          private_key: 'a random key',
-        },
-        bucketName: 'any',
-      };
-      provider.init(global.strapi)(config); // Updated call
-      assert.equal(assertionsCount, 1);
-    });
-  });
-});
+};

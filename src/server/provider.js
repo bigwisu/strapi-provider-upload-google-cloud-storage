@@ -147,9 +147,9 @@ const generateUploadFileName = (file, basePath) => {
       ? `${file.related[0].ref}`
       : `${file.hash}`;
   const filePath = file.path ? `${file.path}/` : `${backupPath}/`;
-  const extension = file.ext ? `${file.ext.toLowerCase()}` : ''; 
-  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash'; 
-  return `${basePath}${filePath}${fileName}${extension}`; 
+  const extension = file.ext ? `${file.ext.toLowerCase()}` : '';
+  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash';
+  return `${basePath}${filePath}${fileName}${extension}`;
 };
 
 /**
