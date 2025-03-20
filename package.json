@@ -55,7 +55,8 @@
     "mocha": "^10.2.0",
     "mock-require": "^3.0.3",
     "nyc": "^15.1.0",
-    "prettier": "^3.0.3"
+    "prettier": "^3.0.3",
+    "sinon": "^19.0.4"
   },
   "engines": {
     "node": ">=18.0.0 <=20.x.x",
