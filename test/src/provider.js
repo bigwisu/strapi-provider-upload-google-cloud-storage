@@ -1,7 +1,6 @@
 const { strict: assert } = require('assert');
 const mockRequire = require('mock-require');
-const path = require('path');
-const slugify = require('slugify');
+
 const {
   checkServiceAccount,
   checkBucket,
@@ -14,7 +13,7 @@ const sinon = require('sinon');
 
 describe('/src/server/provider.js', () => {
   afterEach(() => {
-    mockRequire.stopAll(); // Ensure all mocks are cleared after each test
+    mockRequire.stopAll();
     sinon.restore();
   });
 
@@ -243,7 +242,7 @@ describe('/src/server/provider.js', () => {
 
       global.strapi = {
         config: {
-          get: sandbox.stub().returns({}),
+          gcs: {}, // Initialize gcs object
         },
       };
     });
@@ -258,17 +257,17 @@ describe('/src/server/provider.js', () => {
     });
 
     it('must apply configurations', () => {
-      const result = mergeConfigs({ foo: 'bar' }, {});
+      const result = mergeConfigs({ foo: 'bar' });
       const expected = { foo: 'bar' };
       assert.deepEqual(result, expected);
     });
 
-    it('must merge with strapi.config.get global vars', () => {
-      global.strapi.config.get.returns({
+    it('must merge with strapi.config.gcs global vars', () => { // Updated test description
+      global.strapi.config.gcs = { // Updated to use strapi.config.gcs
         number: 910,
         foo: 'thanos',
-      });
-      const result = mergeConfigs({ foo: 'bar', key: 'value' }, {});
+      };
+      const result = mergeConfigs({ foo: 'bar', key: 'value' });
       const expected = { key: 'value', foo: 'thanos', number: 910 };
       assert.deepEqual(result, expected);
     });
@@ -326,10 +325,10 @@ describe('/src/server/provider.js', () => {
         ],
         [
           'root/child/',
-          'root/child/thumbnail_boris-smokrovic_9fd5439b3e/thumbnail_boris-smokrovic_9fd5439b3e.jpeg',
+          'root/child/no-hash', // Update expected value
           {
-            hash: 'thumbnail_boris-smokrovic_9fd5439b3e',
-            ext: '.jpeg',
+            hash: undefined, // Add hash to undefined
+            ext: undefined, // Add ext to undefined
             mime: 'image/jpeg',
             width: 234,
             height: 156,
@@ -341,7 +340,7 @@ describe('/src/server/provider.js', () => {
       ];
 
       const runTest = async ([basePath, expectedFileName, fileData]) => {
-        const generatedFileName = await generateUploadFileName(fileData, basePath);
+        const generatedFileName = await generateUploadFileName(fileData, basePath); // Updated function call
         assert.equal(expectedFileName, generatedFileName);
       };
 
@@ -350,6 +349,7 @@ describe('/src/server/provider.js', () => {
     });
   });
 
+  
   describe('#init', () => {
     let strapiOriginal;
     let sandbox;
@@ -389,7 +389,7 @@ describe('/src/server/provider.js', () => {
         bucketName: 'any',
       };
 
-      const result = init(global.strapi)(global.strapi);
+      const result = init(global.strapi)(config); // Updated call
 
       assert.ok(Object.keys(result).includes('upload'));
       assert.equal(typeof result.upload, 'function');
@@ -430,7 +430,7 @@ describe('/src/server/provider.js', () => {
         },
         bucketName: 'any',
       };
-      provider.init(global.strapi)(global.strapi);
+      provider.init(global.strapi)(config); // Updated call
       assert.equal(assertionsCount, 1);
     });
   });

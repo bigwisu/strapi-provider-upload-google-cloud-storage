@@ -141,15 +141,15 @@ const mergeConfigs = (providerConfig) => {
  * @param file
  * @returns string
  */
-const generateUploadFileName = (basePath, file) => {
+const generateUploadFileName = (file, basePath) => {
   const backupPath =
     file.related && file.related.length > 0 && file.related[0].ref
       ? `${file.related[0].ref}`
-      : `${file.hash || 'no-hash'}`; // Add a default value if file.hash is undefined
+      : file.hash ? `${file.hash}` : `no-hash`; // Add a default value if file.hash is undefined
   const filePath = file.path ? `${file.path}/` : `${backupPath}/`;
-  const extension = file.ext ? file.ext.toLowerCase() : ''; // Make ext optional
-  const fileName = file.hash ? slugify(path.basename(file.hash)) : 'no-hash'; // Add a default value if file.hash is undefined
-  return `${basePath}${filePath}${fileName}${extension ? '/' : ''}${fileName}${extension}`; // Add / if extension is present
+  const extension = file.ext ? `.${file.ext.toLowerCase()}` : ''; // Make ext optional
+  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash'; // Add a default value if file.hash is undefined
+  return `${basePath}${filePath}${fileName}${extension}`; // Add . if extension is present
 };
 
 /**
@@ -195,15 +195,17 @@ const prepareUploadFile = async (file, config, basePath, GCS) => {
   return { fileAttributes, bucketFile, fullFileName, deleteFile };
 };
 
-const init = (strapi) => {
-  const config = strapi.config.get('plugin.upload.providerOptions');
-  const serviceAccount = checkServiceAccount(config);
+const init = (strapi) => (config) => { // Updated to receive config
+  const serviceAccount = checkServiceAccount(config); // Updated to pass config
   let GCS;
   if (config.keyFileContent) {
     // Provide service account credentials
     GCS = new Storage({
-      projectId: serviceAccount.project_id,
-      credentials: config.serviceAccount,
+      projectId: serviceAccount.project_id, // Pass projectId separately
+      credentials: {
+        client_email: serviceAccount.client_email,
+        private_key: serviceAccount.private_key,
+      }, // Pass credentials separately
     });
   } else {
     // Storage will attempt to find Application Default Credentials
