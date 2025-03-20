@@ -1,31 +1,66 @@
+// src/index.js
 'use strict';
 
-const provider = require('./server/provider');
+const { Storage } = require('@google-cloud/storage');
+const slugify = require('slugify');
 
 module.exports = {
-  register: ({ strapi }) => {
-    strapi.log.info('Registering Google Cloud Storage upload provider');
-  },
-  bootstrap: ({ strapi }) => {
-    strapi.log.info('Bootstrapping Google Cloud Storage upload provider');
-  },
-  config: {
-    default: require('./config'),
-    validator: (config) => {
-      if (!config.bucketName) {
-        throw new Error('Bucket name (GCS_BUCKET_NAME) is required in the provider configuration.');
-      }
-      if (!config.keyFileContent) {
-        throw new Error('keyFileContent (GCS_KEY_FILE_CONTENT) is required in the provider configuration.');
-      }
-    },
-  },
-  destroy: ({ strapi }) => {
-    strapi.log.info('Destroying Google Cloud Storage upload provider');
-  },
-  providers: {
-    'strapi-provider-upload-google-cloud-storage': {
-      init: provider.init,
-    },
+  init: (config) => {
+    // 1. Receive the configuration
+    const {
+      bucketName,
+      basePath,
+      publicPath,
+      keyFilename,
+      projectId,
+      ...rest
+    } = config;
+
+    // Validate required config
+    if (!bucketName) {
+      throw new Error('Bucket name is required');
+    }
+
+    // 2. Set up the Google Cloud Storage client
+    const storage = new Storage({
+      projectId,
+      keyFilename,
+      ...rest,
+    });
+
+    const bucket = storage.bucket(bucketName);
+
+    // 3. Return the provider's interface
+    return {
+      upload: async (file) => {
+        return new Promise((resolve, reject) => {
+          const filename = `${basePath}/${slugify(file.hash)}${file.ext}`;
+          const fileUpload = bucket.file(filename);
+
+          const stream = fileUpload.createWriteStream({
+            metadata: {
+              contentType: file.mime,
+            },
+          });
+
+          stream.on('error', (err) => {
+            reject(err);
+          });
+
+          stream.on('finish', () => {
+            fileUpload.makePublic().then(() => {
+              file.url = `${publicPath}/${filename}`;
+              resolve();
+            });
+          });
+
+          stream.end(file.buffer);
+        });
+      },
+      delete: async (file) => {
+        const filename = `${basePath}/${slugify(file.hash)}${file.ext}`;
+        return bucket.file(filename).delete();
+      },
+    };
   },
 };

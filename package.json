@@ -39,7 +39,7 @@
     "url": "git+https://github.com/strapi-community/strapi-provider-upload-google-cloud-storage.git"
   },
   "peerDependencies": {
-    "@strapi/strapi": "^5.0.0"
+    "@strapi/strapi": "^5.11.2"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.7.0",
