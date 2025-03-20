@@ -142,14 +142,14 @@ const mergeConfigs = (providerConfig) => {
  * @returns string
  */
 const generateUploadFileName = (file, basePath) => {
-  const backupPath =
-    file.related && file.related.length > 0 && file.related[0].ref
+  const backupPath = 
+    file.related && file.related.length > 0 && file.related[0].ref 
       ? `${file.related[0].ref}`
-      : file.hash ? `${file.hash}` : `no-hash`; // Add a default value if file.hash is undefined
+      : `${file.hash}`;
   const filePath = file.path ? `${file.path}/` : `${backupPath}/`;
-  const extension = file.ext ? `.${file.ext.toLowerCase()}` : ''; // Make ext optional
-  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash'; // Add a default value if file.hash is undefined
-  return `${basePath}${filePath}${fileName}${extension}`; // Add . if extension is present
+  const extension = file.ext ? `${file.ext.toLowerCase()}` : ''; 
+  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash'; 
+  return `${basePath}${filePath}${fileName}${extension}`; 
 };
 
 /**
