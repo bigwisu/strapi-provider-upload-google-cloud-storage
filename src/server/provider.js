@@ -61,20 +61,23 @@ const checkServiceAccount = (config) => {
       }
       config.serviceAccount = serviceAccount;
     } catch (error) {
-        if (error instanceof SyntaxError) {
-            throw new Error(
-              'Error parsing data "keyFileContent", please be sure to copy/paste the full JSON file.'
-            );
-        }
-        if (
-          typeof config.keyFileContent === 'string' &&
-          !config.keyFileContent.includes('private_key')
-        ) {
-          throw new Error(
-            'Error parsing data "keyFileContent". Missing "private_key" field in JSON file.'
-          );
-        }
-        throw error;
+      if (error instanceof SyntaxError) {
+        throw new Error(
+          `Error parsing data "keyFileContent": Invalid JSON format. Please ensure you have copied the full JSON file correctly.`
+        );
+      }
+      if (
+        typeof config.keyFileContent === 'string' &&
+        !config.keyFileContent.includes('private_key')
+      ) {
+        throw new Error(
+          `Error parsing data "keyFileContent": Missing "private_key" field in JSON file.`
+        );
+      }
+      // throw error;
+      throw new Error(
+        `Error with Service Account configuration: ${error.message}`
+      )
     }
   }
   if (!config.baseUrl) {
@@ -142,8 +145,8 @@ const mergeConfigs = (providerConfig) => {
  * @returns string
  */
 const generateUploadFileName = (file, basePath) => {
-  const backupPath = 
-    file.related && file.related.length > 0 && file.related[0].ref 
+  const backupPath =
+    file.related && file.related.length > 0 && file.related[0].ref
       ? `${file.related[0].ref}`
       : `${file.hash}`;
   const filePath = file.path ? `${file.path}/` : `${backupPath}/`;
@@ -165,7 +168,7 @@ const prepareUploadFile = async (file, config, basePath, GCS) => {
   const fullFileName =
     typeof config.generateUploadFileName === 'function'
       ? await config.generateUploadFileName(file)
-      : generateUploadFileName(basePath, file);
+      : generateUploadFileName(file, basePath);
   if (!config.skipCheckBucket) {
     await checkBucket(GCS, config.bucketName);
   }
@@ -184,9 +187,9 @@ const prepareUploadFile = async (file, config, basePath, GCS) => {
       typeof config.metadata === 'function'
         ? config.metadata(file)
         : {
-            contentDisposition: `inline; filename="${asciiFileName}"`,
-            cacheControl: `public, max-age=${config.cacheMaxAge || 3600}`,
-          },
+          contentDisposition: `inline; filename="${asciiFileName}"`,
+          cacheControl: `public, max-age=${config.cacheMaxAge || 3600}`,
+        },
   };
   if (!config.uniform) {
     fileAttributes.public = config.publicFiles;
@@ -215,7 +218,7 @@ const init = (strapi) => (config) => { // Updated to receive config
   const basePath = `${config.basePath}/`.replace(/^\/+/, '');
   const baseUrl = config.domain ? `https://${config.domain}` : `https://storage.googleapis.com/${config.bucketName}`;
 
-  return {
+  const provider = {
     async upload(file) {
       try {
         const { fileAttributes, bucketFile, fullFileName, deleteFile } = await prepareUploadFile(
@@ -226,7 +229,7 @@ const init = (strapi) => (config) => { // Updated to receive config
         );
         if (deleteFile) {
           console.info('File already exists. Try to remove it.');
-          await this.delete(file);
+          await provider.delete(file);
         }
 
         await bucketFile.save(file.buffer, fileAttributes);
@@ -249,7 +252,7 @@ const init = (strapi) => (config) => { // Updated to receive config
         );
         if (deleteFile) {
           console.info('File already exists. Try to remove it.');
-          await this.delete(file);
+          await provider.delete(file);
         }
         await pipeline(file.stream, bucketFile.createWriteStream(fileAttributes));
         console.debug(`File successfully uploaded to ${file.url}`);
@@ -295,6 +298,7 @@ const init = (strapi) => (config) => { // Updated to receive config
       return { url };
     },
   };
+  return provider;
 };
 
 module.exports = {
