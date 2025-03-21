@@ -9,6 +9,11 @@ const { pipeline } = require('stream/promises');
  * lodash _.get native port
  *
  * checkout: https://github.com/you-dont-need/You-Dont-Need-Lodash-Underscore#_get
+ *
+ * Another solution is use destructor variable with default value as {} on each layer
+ * but it appears so tricky.
+ *
+ * const { a: { b: { c: d = 42 } = {} } = {} } = object
  */
 const get = (obj, path, defaultValue = undefined) => {
   const travel = (regexp) =>
@@ -61,6 +66,7 @@ const checkServiceAccount = (config = {}) => {
 
   /** Check or set default boolean optional variable */
   config.publicFiles = setConfigField(config.publicFiles, true); // default value
+  config.uniform = setConfigField(config.uniform, false); // default value
   config.skipCheckBucket = setConfigField(config.skipCheckBucket, false); // default value
 
   let serviceAccount;
@@ -72,7 +78,7 @@ const checkServiceAccount = (config = {}) => {
           : config.serviceAccount;
     } catch (e) {
       throw new Error(
-        'Error parsing data "serviceAccount", please be sure to copy/paste the full JSON file.'
+        'Error parsing data "Service Account JSON", please be sure to copy/paste the full JSON file.'
       );
     }
 
@@ -81,20 +87,21 @@ const checkServiceAccount = (config = {}) => {
      */
     if (!serviceAccount.project_id) {
       throw new Error(
-        'Error parsing data "serviceAccount". Missing "project_id" field in JSON file.'
+        'Error parsing data "Service Account JSON". Missing "project_id" field in JSON file.'
       );
     }
     if (!serviceAccount.client_email) {
       throw new Error(
-        'Error parsing data "serviceAccount". Missing "client_email" field in JSON file.'
+        'Error parsing data "Service Account JSON". Missing "client_email" field in JSON file.'
       );
     }
     if (!serviceAccount.private_key) {
       throw new Error(
-        'Error parsing data "serviceAccount". Missing "private_key" field in JSON file.'
+        'Error parsing data "Service Account JSON". Missing "private_key" field in JSON file.'
       );
     }
   }
+
   return serviceAccount;
 };
 
@@ -105,7 +112,8 @@ const checkServiceAccount = (config = {}) => {
  * @returns {Promise<void>}
  */
 const checkBucket = async (GCS, bucketName) => {
-  const [exists] = await GCS.bucket(bucketName).exists();
+  let bucket = GCS.bucket(bucketName);
+  const [exists] = await bucket.exists();
   if (!exists) {
     throw new Error(
       `An error occurs when we try to retrieve the Bucket "${bucketName}". Check if bucket exist on Google Cloud Platform.`
@@ -118,7 +126,7 @@ const checkBucket = async (GCS, bucketName) => {
  * @param providerConfig
  * @returns {{private_key}|{client_email}|{project_id}|any}
  */
-const mergeConfigs = (strapi, providerConfig) => {
+const mergeConfigs = (providerConfig) => {
   const customGcsConfig = get(strapi, 'config.gcs', {});
   const customEnvGcsConfig = get(strapi, 'config.currentEnvironment.gcs', {});
   return { ...providerConfig, ...customGcsConfig, ...customEnvGcsConfig };
@@ -137,8 +145,8 @@ const generateUploadFileName = (basePath, file) => {
       ? `${file.related[0].ref}`
       : `${file.hash}`;
   const filePath = file.path ? `${file.path}/` : `${backupPath}/`;
-  const extension = file.ext ? `${file.ext.toLowerCase()}` : '';
-  const fileName = file.hash ? `${slugify(path.basename(file.hash))}` : 'no-hash';
+  const extension = file.ext.toLowerCase();
+  const fileName = slugify(path.basename(file.hash));
   return `${basePath}${filePath}${fileName}${extension}`;
 };
 
@@ -151,6 +159,7 @@ const generateUploadFileName = (basePath, file) => {
  * @returns {Promise<{fileAttributes: {metadata: (*|{contentDisposition: string, cacheControl: string}), gzip: (string|boolean|((buf: InputType, callback: CompressCallback) => void)|((buf: InputType, options: ZlibOptions, callback: CompressCallback) => void)|gzip|*), contentType: (string|string|*)}, fullFileName: (string|Promise<string>|*|string)}>}
  */
 const prepareUploadFile = async (file, config, basePath, GCS) => {
+  let deleteFile = false;
   const fullFileName =
     typeof config.generateUploadFileName === 'function'
       ? await config.generateUploadFileName(file)
@@ -158,9 +167,12 @@ const prepareUploadFile = async (file, config, basePath, GCS) => {
   if (!config.skipCheckBucket) {
     await checkBucket(GCS, config.bucketName);
   }
-  const bucketFile = GCS.bucket(config.bucketName).file(fullFileName);
+  const bucket = GCS.bucket(config.bucketName);
+  const bucketFile = bucket.file(fullFileName);
   const [fileExists] = await bucketFile.exists();
-  const deleteFile = fileExists;
+  if (fileExists) {
+    deleteFile = true;
+  }
   const asciiFileName = file.name.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
   const fileAttributes = {
     contentType:
@@ -170,38 +182,45 @@ const prepareUploadFile = async (file, config, basePath, GCS) => {
       typeof config.metadata === 'function'
         ? config.metadata(file)
         : {
-          contentDisposition: `inline; filename="${asciiFileName}"`,
-          cacheControl: `public, max-age=${config.cacheMaxAge || 3600}`,
-        },
+            contentDisposition: `inline; filename="${asciiFileName}"`,
+            cacheControl: `public, max-age=${config.cacheMaxAge || 3600}`,
+          },
   };
+  if (!config.uniform) {
+    fileAttributes.public = config.publicFiles;
+  }
 
   return { fileAttributes, bucketFile, fullFileName, deleteFile };
 };
 
-const getGCS = (config) => {
+/**
+ *
+ * @param providerConfig
+ * @returns {{uploadStream(*): Promise<void>, upload(*): Promise<void>, delete(*): Promise<void>}}
+ */
+const init = (providerConfig) => {
+  const config = mergeConfigs(providerConfig);
   const serviceAccount = checkServiceAccount(config);
+  let GCS;
   if (serviceAccount) {
-    return new Storage({
+    // Provide service account credentials
+    GCS = new Storage({
+      projectId: serviceAccount.project_id,
       credentials: {
         client_email: serviceAccount.client_email,
         private_key: serviceAccount.private_key,
       },
-      projectId: serviceAccount.project_id,
     });
   } else {
-    return new Storage();
+    // Storage will attempt to find Application Default Credentials
+    GCS = new Storage();
   }
-};
 
-const init = (strapi) => (providerConfig) => {
-  const provider = {
+  const basePath = `${config.basePath}/`.replace(/^\/+/, '');
+  const baseUrl = config.baseUrl.replace('{bucket-name}', config.bucketName);
+
+  return {
     async upload(file) {
-      const config = mergeConfigs(strapi, providerConfig);
-      // Enforce uniform: true
-      config.uniform = true;
-      const GCS = getGCS(config);
-      const basePath = `${config.basePath}/`.replace(/^\/+/, '');
-      const baseUrl = config.baseUrl.replace('{bucket-name}', config.bucketName);
       try {
         const { fileAttributes, bucketFile, fullFileName, deleteFile } = await prepareUploadFile(
           file,
@@ -220,17 +239,11 @@ const init = (strapi) => (providerConfig) => {
       } catch (error) {
         // Re-throw so that the upload operation will fail
         // and error will surface to the user in the Strapi admin front-end
-        console.error(`Error uploading (upload) file to Google Cloud Storage: ${error.message}`);
+        console.error(`Error uploading file to Google Cloud Storage: ${error.message}`);
         throw error;
       }
     },
     async uploadStream(file) {
-      const config = mergeConfigs(strapi, providerConfig);
-      // Enforce uniform: true
-      config.uniform = true;
-      const GCS = getGCS(config);
-      const basePath = `${config.basePath}/`.replace(/^\/+/, '');
-      const baseUrl = config.baseUrl.replace('{bucket-name}', config.bucketName);
       try {
         const { fileAttributes, bucketFile, fullFileName, deleteFile } = await prepareUploadFile(
           file,
@@ -243,50 +256,38 @@ const init = (strapi) => (providerConfig) => {
           await this.delete(file);
         }
         await pipeline(file.stream, bucketFile.createWriteStream(fileAttributes));
+        console.debug(`File successfully uploaded to ${file.url}`);
         file.url = `${baseUrl}/${fullFileName}`;
       } catch (error) {
         // Re-throw so that the upload operation will fail
         // and error will surface to the user in the Strapi admin front-end
-        console.error(`Error uploading (uploadStream) file to Google Cloud Storage: ${error.message}`);
+        console.error(`Error uploading file to Google Cloud Storage: ${error.message}`);
         throw error;
       }
     },
     async delete(file) {
-      const config = mergeConfigs(strapi, providerConfig);
-      // Enforce uniform: true
-      config.uniform = true;
-      const GCS = getGCS(config);
-      const baseUrl = config.baseUrl.replace('{bucket-name}', config.bucketName);
       if (!file.url) {
         console.warn('Remote file was not found, you may have to delete manually.');
         return;
       }
 
       const fileName = file.url.replace(`${baseUrl}/`, '');
+      const bucket = GCS.bucket(config.bucketName);
       try {
-        await GCS.bucket(config.bucketName).file(fileName).delete();
-        strapi.log.debug(`File ${fileName} successfully deleted`);
+        await bucket.file(fileName).delete();
+        console.debug(`File ${fileName} successfully deleted`);
       } catch (error) {
         if (error.code === 404) {
-          strapi.log.error('Remote file was not found, you may have to delete manually.');
-        } else {
-          strapi.log.error(`Error deleting file ${fileName}: ${error.message}`);
-          throw error;
+          console.warn('Remote file was not found, you may have to delete manually.');
         }
+        // based on last code, it will never throw (resolves and rejects)
+        // throw error;
       }
     },
     isPrivate() {
-      const config = mergeConfigs(strapi, providerConfig);
-      // Enforce uniform: true
-      config.uniform = true;
       return !config.publicFiles;
     },
     async getSignedUrl(file) {
-      const config = mergeConfigs(strapi, providerConfig);
-      // Enforce uniform: true
-      config.uniform = true;
-      const GCS = getGCS(config);
-      const baseUrl = config.baseUrl.replace('{bucket-name}', config.bucketName);
       const options = {
         version: 'v4',
         action: 'read',
@@ -297,16 +298,15 @@ const init = (strapi) => (providerConfig) => {
       return { url };
     },
   };
-  return provider;
 };
 
 module.exports = {
+  get,
   checkServiceAccount,
-  checkBucket,
   setConfigField,
+  checkBucket,
   mergeConfigs,
   generateUploadFileName,
   prepareUploadFile,
   init,
-  getGCS,
 };
